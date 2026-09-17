@@ -1,4 +1,4 @@
-# BinarySpy
+﻿# BinarySpy
 
 > 一个自动 patch shellcode 到二进制文件的工具，用于免杀研究
 
@@ -43,11 +43,11 @@ SigFlip 是基于证书表填充技术的签名操作工具。
 
 ## 截图
 
-![1775027002243](image/zh_README/1775027002243.png)
+![1775027002243](docs/image/zh_README/1775027002243.png)
 
-![1775641012496](image/zh_README/1775641012496.png)
+![1775641012496](docs/image/zh_README/1775641012496.png)
 
-![1775641018045](image/zh_README/1775641018045.png)
+![1775641018045](docs/image/zh_README/1775641018045.png)
 
 ## 快速开始
 
